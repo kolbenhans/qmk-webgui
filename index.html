@@ -141,6 +141,8 @@
   <button id="export" disabled>Export…</button>
   <button id="import" disabled>Import…</button>
   <input type="file" id="import-file" accept="application/json,.json" hidden>
+  <button id="load-layout" disabled title="Fallback if the device's own vial.json has no rgb_matrix.layout — load a local qmk-webgui/qmk-info export instead">Load layout…</button>
+  <input type="file" id="load-layout-file" accept="application/json,.json" hidden>
   <button id="connect" disabled>Connect</button>
   <button id="disconnect" disabled>Disconnect</button>
   <button id="save" class="primary" disabled>Save (EEPROM)</button>
@@ -268,6 +270,8 @@ const saveBtn     = document.getElementById('save');
 const exportBtn   = document.getElementById('export');
 const importBtn   = document.getElementById('import');
 const importFileEl = document.getElementById('import-file');
+const loadLayoutBtn = document.getElementById('load-layout');
+const loadLayoutFileEl = document.getElementById('load-layout-file');
 const popupEl     = document.getElementById('picker-popup');
 const ppColorEl   = document.getElementById('pp-color');
 const ppHexEl     = document.getElementById('pp-hex');
@@ -607,13 +611,33 @@ function resetBoard() {
 // generiert wird, nur direkt vom Gerät statt aus Repo-Dateien. Board-
 // unabhängig portabel: funktioniert unverändert auf jedem Vial-Board, egal
 // ob Split oder Unibody, egal wie viele LEDs/Layer.
-async function loadLayoutFromDevice() {
-    const json = await fetchVialDefinitionJson();
+// Gemeinsam von loadLayoutFromDevice() (live HID) und loadLayoutFromFile()
+// (lokaler Export -- z.B. `qmk info -kb <kb> -km <km> -f json`, gleiche
+// rgb_matrix.layout/layouts.keymap-Form) -- Fallback für Boards, deren
+// eigenes vial.json kein rgb_matrix.layout hat (der Normalfall, siehe
+// qmk-modules/docs/vial-json-rgb-matrix-layout.md) oder gar kein Vial
+// sprechen. Wirft, wenn json diese Form nicht hat.
+// Vials eigenes vial.json/Live-Definition trägt die Tasten roh als KLE unter
+// layouts.keymap. `qmk info -f json` (die andere unterstützte Quelle, s.o.)
+// legt dieselbe Info stattdessen schon geparst unter layouts.<Name>.layout
+// ab ({matrix,x,y} pro Taste, kein KLE) — beide Formen hier abfangen.
+function extractKeysFromLayouts(layouts) {
+    if (layouts && Array.isArray(layouts.keymap)) {
+        return parseKleKeymap(layouts.keymap);
+    }
+    const named = layouts && Object.values(layouts).find(l => Array.isArray(l && l.layout));
+    if (named) {
+        return named.layout.filter(k => k.matrix).map(k => ({ matrix: k.matrix, x: k.x, y: k.y }));
+    }
+    throw new Error('definition has no layouts.keymap or layouts.<name>.layout');
+}
+
+function applyVialDefinition(json) {
     if (!json.rgb_matrix || !json.rgb_matrix.layout) {
-        throw new Error('Vial definition has no rgb_matrix.layout — cannot map LEDs to keys');
+        throw new Error('definition has no rgb_matrix.layout — cannot map LEDs to keys');
     }
 
-    keyboardName = json.name || 'Keyboard';
+    keyboardName = json.name || json.keyboard_name || 'Keyboard';
     titleEl.innerHTML = keyboardName + ' <span class="dim">/ WebHID</span>';
     LED_COUNT = json.rgb_matrix.layout.length;
 
@@ -628,7 +652,7 @@ async function loadLayoutFromDevice() {
         ugEntries.push({ led, x: entry.x, y: entry.y });
     });
 
-    lastKeys = parseKleKeymap(json.layouts.keymap); // [{matrix:[row,col], x, y}, ...] (Encoder-Labels raus)
+    lastKeys = extractKeysFromLayouts(json.layouts); // [{matrix:[row,col], x, y}, ...]
     lastMatrixToLed = matrixToLed;
     lastUgEntries = ugEntries;
 
@@ -636,6 +660,24 @@ async function loadLayoutFromDevice() {
     resetBoard();
     layoutKeys(lastKeys, lastMatrixToLed);
     layoutUnderglow(lastUgEntries);
+}
+
+async function loadLayoutFromDevice() {
+    applyVialDefinition(await fetchVialDefinitionJson());
+}
+
+// Fallback für den Fall, dass das Gerät kein rgb_matrix.layout mitbringt
+// (oder gar kein Vial spricht) -- lädt stattdessen eine lokal exportierte
+// Definition. Bleibt bewusst getrennt von importConfig() (das importiert
+// Farben, nicht das Layout).
+async function loadLayoutFromFile(file) {
+    let json;
+    try {
+        json = JSON.parse(await file.text());
+    } catch (err) {
+        throw new Error('not valid JSON');
+    }
+    applyVialDefinition(json);
 }
 
 // Sendet einen 32-Byte Report (report ID 0, device hat keine numbered reports).
@@ -1116,24 +1158,46 @@ async function connect() {
         device.addEventListener('inputreport', onInputReport);
 
         setStatus('Reading layout from keyboard …');
-        await loadLayoutFromDevice();
-        LAYER_COUNT = await viaGetLayerCount();
-        colors = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill('#000000'));
-        blinkColors = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill('#000000'));
-        lockFlags = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill(0));
-
-        buildLayerTabs();
-        connectBtn.disabled = true;
-        disconnectBtn.disabled = false;
-        saveBtn.disabled = false;
-        exportBtn.disabled = false;
-        importBtn.disabled = false;
-        statusEl.classList.add('connected');
-        await selectLayer(0);
+        try {
+            await loadLayoutFromDevice();
+        } catch (err) {
+            // Kein Grund, die ganze Verbindung wegzuwerfen -- Gerät bleibt
+            // offen, nur der Layout-Teil fehlt. "Load layout…" nimmt eine
+            // lokal exportierte Definition stattdessen (siehe
+            // loadLayoutFromFile/applyVialDefinition oben).
+            setStatus(
+                'Layout fetch failed: ' + err.message + ' — click "Load layout…" to load one from a local file',
+                true
+            );
+            disconnectBtn.disabled = false;
+            loadLayoutBtn.disabled = false;
+            return;
+        }
+        await finishConnect();
     } catch (err) {
         setStatus('Connection failed: ' + err.message, true);
         if (device) { try { await device.close(); } catch (_) {} device = null; }
     }
+}
+
+// Der Teil von connect(), der erst laufen kann, wenn LED_COUNT/das Layout
+// bekannt ist -- egal ob das vom Gerät kam oder über "Load layout…" aus
+// einer Datei.
+async function finishConnect() {
+    LAYER_COUNT = await viaGetLayerCount();
+    colors = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill('#000000'));
+    blinkColors = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill('#000000'));
+    lockFlags = Array.from({length: LAYER_COUNT}, () => new Array(LED_COUNT).fill(0));
+
+    buildLayerTabs();
+    connectBtn.disabled = true;
+    disconnectBtn.disabled = false;
+    saveBtn.disabled = false;
+    exportBtn.disabled = false;
+    importBtn.disabled = false;
+    loadLayoutBtn.disabled = true;
+    statusEl.classList.add('connected');
+    await selectLayer(0);
 }
 
 async function disconnect() {
@@ -1153,6 +1217,7 @@ async function disconnect() {
     saveBtn.disabled = true;
     exportBtn.disabled = true;
     importBtn.disabled = true;
+    loadLayoutBtn.disabled = true;
     statusEl.classList.remove('connected');
     setStatus('Disconnected — click Connect');
 }
@@ -1280,6 +1345,18 @@ if (!('hid' in navigator)) {
     importFileEl.onchange = () => {
         if (importFileEl.files[0]) importConfig(importFileEl.files[0]);
         importFileEl.value = ''; // gleiche Datei erneut auswählbar
+    };
+    loadLayoutBtn.onclick = () => loadLayoutFileEl.click();
+    loadLayoutFileEl.onchange = async () => {
+        if (!loadLayoutFileEl.files[0]) return;
+        try {
+            setStatus('Loading layout from file …');
+            await loadLayoutFromFile(loadLayoutFileEl.files[0]);
+            await finishConnect();
+        } catch (err) {
+            setStatus('Layout load failed: ' + err.message, true);
+        }
+        loadLayoutFileEl.value = ''; // gleiche Datei erneut auswählbar
     };
 }
 </script>
